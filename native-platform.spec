@@ -1,15 +1,18 @@
 Name:		native-platform
-Version:	0.22.milestone.26
+Version:	0.22.milestone.30
 Release:	1
 Summary:	Java bindings for native operating system APIs
 Group:		Development/Java
 License:	ASL 2.0
 URL:		https://github.com/gradle/native-platform
-# Gradle 8.11.1 strictly requests 0.22-milestone-26. RPM versions and
-# mvn() provides cannot contain a hyphen, so the archive and the POM use
-# dots. sysjar rewrites a request for the hyphenated version to this one.
-%global tag 0.22-milestone-26
+# RPM versions and mvn() provides cannot contain a hyphen, so the
+# archive name and the POM use dots. sysjar rewrites a request for the
+# hyphenated Gradle pin to this version.
+%global tag 0.22-milestone-30
+%global old_tag 0.22-milestone-26
+%global old_ver 0.22.milestone.26
 Source0:	https://github.com/gradle/native-platform/archive/refs/tags/%{tag}.tar.gz#/%{name}-%{version}.tar.gz
+Source1:	https://github.com/gradle/native-platform/archive/refs/tags/%{old_tag}.tar.gz#/%{name}-%{old_ver}.tar.gz
 
 %ifarch aarch64
 %global np_id linux-aarch64
@@ -33,24 +36,29 @@ Requires:	libncursesw.so.6()(64bit)
 Requires:	libstdc++.so.6()(64bit)
 
 %description
-native-platform is the JNI layer Gradle uses for processes, filesystems,
-terminals and inotify file watching. This package builds that layer from
-source and provides mvn(net.rubygrapefruit:native-platform) and
-mvn(net.rubygrapefruit:file-events) at %{version}. Gradle 8.11.1 asks for
-%{tag}, and sysjar rewrites that request. The jars contain the libraries
-for this architecture, linked against ncurses 6. jsr305 is compile-only
-upstream and is stubbed during the build.
+native-platform is the JNI layer Gradle uses for processes, filesystems
+and terminals. This package builds that layer from source.
+mvn(net.rubygrapefruit:native-platform) is provided at %{version} and at
+%{old_ver}. Milestone 30 no longer contains the file-events module, so
+mvn(net.rubygrapefruit:file-events) stays at %{old_ver}. The jars contain
+the libraries for this architecture, linked against ncurses 6. jsr305 is
+compile-only upstream and is stubbed during the build.
 
 %prep
 %autosetup -n %{name}-%{tag}
 rm -f gradle/wrapper/gradle-wrapper.jar
-chmod a-x readme.md LICENSE || :
+%setup -q -T -D -a 1 -n %{name}-%{tag}
+rm -f %{name}-%{old_tag}/gradle/wrapper/gradle-wrapper.jar
+find . \( -name '*.jar' -o -name '*.class' -o -name '*.so' -o -name '*.node' -o -name '*.wasm' \) -delete
+chmod a-x readme.md LICENSE %{name}-%{old_tag}/readme.md %{name}-%{old_tag}/LICENSE || :
 
 %build
 export JAVA_HOME=%{_jvmdir}/java-openjdk
 export PATH=$JAVA_HOME/bin:$PATH
 
-# com.google.code.findbugs:jsr305 is compileOnly and is not in cooker.
+# com.google.code.findbugs:jsr305 is compileOnly. The packaged jsr305
+# modules jar is newer than --release 8, so the three annotations used
+# here are stubbed.
 mkdir -p stub/javax/annotation/concurrent
 cat > stub/javax/annotation/Nullable.java <<'END'
 package javax.annotation;
@@ -79,92 +87,97 @@ javac --release 8 -encoding UTF-8 -Xlint:-options -d stub \
 	stub/javax/annotation/concurrent/NotThreadSafe.java
 jar cf jsr305-stub.jar -C stub javax
 
-# The same string is compiled into the Java interface and the native
-# header. Native.init rejects a library whose version does not match.
-mkdir -p gen/net/rubygrapefruit/platform/internal/jni headers
-cat > gen/net/rubygrapefruit/platform/internal/jni/NativeVersion.java <<END
+# root, hyphenated native tag, dotted Maven version, output dir, build file-events
+build_one() {
+	root="$1"
+	tag="$2"
+	ver="$3"
+	out="$4"
+	with_fe="$5"
+	mkdir -p "$out/gen/net/rubygrapefruit/platform/internal/jni" "$out/headers" \
+		"$out/np-classes" "$out/objs/np" "$out/objs/curses"
+	cat > "$out/gen/net/rubygrapefruit/platform/internal/jni/NativeVersion.java" <<END
 package net.rubygrapefruit.platform.internal.jni;
 public interface NativeVersion {
-    String VERSION = "%{tag}";
+    String VERSION = "$tag";
 }
 END
-cat > gen/net/rubygrapefruit/platform/internal/jni/FileEventsVersion.java <<END
-package net.rubygrapefruit.platform.internal.jni;
-public interface FileEventsVersion {
-    String VERSION = "%{tag}";
-}
-END
-cat > headers/native_platform_version.h <<END
+	cat > "$out/headers/native_platform_version.h" <<END
 #ifndef __INCLUDE_NATIVE_PLATFORM_VERSION_H__
 #define __INCLUDE_NATIVE_PLATFORM_VERSION_H__
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define NATIVE_VERSION "%{tag}"
+#define NATIVE_VERSION "$tag"
 #ifdef __cplusplus
 }
 #endif
 #endif
 END
-
-mkdir -p np-classes fe-classes
-find native-platform/src/main/java -name '*.java' > np.sources
-echo gen/net/rubygrapefruit/platform/internal/jni/NativeVersion.java >> np.sources
-javac --release 8 -encoding UTF-8 -Xlint:-options \
-	-cp jsr305-stub.jar -d np-classes -h headers @np.sources
-find file-events/src/main/java -name '*.java' > fe.sources
-echo gen/net/rubygrapefruit/platform/internal/jni/FileEventsVersion.java >> fe.sources
-javac --release 8 -encoding UTF-8 -Xlint:-options \
-	-cp jsr305-stub.jar:np-classes -d fe-classes -h headers @fe.sources
-
-jdk_inc="$JAVA_HOME/include"
-cxx="clang++ %{optflags} -std=c++11 -fPIC -D_FILE_OFFSET_BITS=64 -pthread"
-np_inc="-Iheaders -I$jdk_inc -I$jdk_inc/linux -Inative-platform/src/shared/headers"
-fe_inc="-Iheaders -I$jdk_inc -I$jdk_inc/linux -Ifile-events/src/file-events/headers"
-# glibc marks readdir_r deprecated. Upstream passes -Werror, which fails here.
-mkdir -p objs/np objs/curses objs/fe
-i=0
-for src in native-platform/src/shared/cpp/*.cpp native-platform/src/main/cpp/*.cpp; do
-	$cxx $np_inc -c "$src" -o "$(printf 'objs/np/%02d.o' "$i")"
-	i=$((i + 1))
-done
-clang++ -shared %{build_ldflags} -pthread -o libnative-platform.so objs/np/*.o
-
-i=0
-for src in native-platform/src/shared/cpp/*.cpp native-platform/src/curses/cpp/*.cpp; do
-	$cxx $np_inc $(pkg-config --cflags ncursesw) -c "$src" -o "$(printf 'objs/curses/%02d.o' "$i")"
-	i=$((i + 1))
-done
-clang++ -shared %{build_ldflags} -pthread -o libnative-platform-curses.so objs/curses/*.o $(pkg-config --libs ncursesw)
-
-i=0
-for src in file-events/src/file-events/cpp/*.cpp; do
-	$cxx $fe_inc -c "$src" -o "$(printf 'objs/fe/%02d.o' "$i")"
-	i=$((i + 1))
-done
-clang++ -shared %{build_ldflags} -pthread -ldl -o libnative-platform-file-events.so objs/fe/*.o
-
-strip --strip-unneeded libnative-platform.so libnative-platform-curses.so libnative-platform-file-events.so
-
-mkdir -p np-jar/net/rubygrapefruit/platform/%{np_id} \
-	np-jar/net/rubygrapefruit/platform/%{np_id}-ncurses6 \
-	fe-jar/net/rubygrapefruit/platform/%{np_id}
-cp -a np-classes/. np-jar/
-cp -a fe-classes/. fe-jar/
-rm -rf np-jar/javax fe-jar/javax
-cp libnative-platform.so np-jar/net/rubygrapefruit/platform/%{np_id}/
-cp libnative-platform-curses.so np-jar/net/rubygrapefruit/platform/%{np_id}-ncurses6/
-cp libnative-platform-file-events.so fe-jar/net/rubygrapefruit/platform/%{np_id}/
-jar cf native-platform.jar -C np-jar .
-jar cf file-events.jar -C fe-jar .
-
-cat > native-platform.pom <<END
+	find "$root/native-platform/src/main/java" -name '*.java' > "$out/np.sources"
+	echo "$out/gen/net/rubygrapefruit/platform/internal/jni/NativeVersion.java" >> "$out/np.sources"
+	javac --release 8 -encoding UTF-8 -Xlint:-options \
+		-cp jsr305-stub.jar -d "$out/np-classes" -h "$out/headers" @"$out/np.sources"
+	jdk_inc="$JAVA_HOME/include"
+	cxx="clang++ %{optflags} -std=c++11 -fPIC -D_FILE_OFFSET_BITS=64 -pthread"
+	np_inc="-I$out/headers -I$jdk_inc -I$jdk_inc/linux -I$root/native-platform/src/shared/headers"
+	i=0
+	for src in "$root"/native-platform/src/shared/cpp/*.cpp "$root"/native-platform/src/main/cpp/*.cpp; do
+		$cxx $np_inc -c "$src" -o "$(printf "$out/objs/np/%02d.o" "$i")"
+		i=$((i + 1))
+	done
+	clang++ -shared %{build_ldflags} -pthread -o "$out/libnative-platform.so" "$out"/objs/np/*.o
+	i=0
+	for src in "$root"/native-platform/src/shared/cpp/*.cpp "$root"/native-platform/src/curses/cpp/*.cpp; do
+		$cxx $np_inc $(pkg-config --cflags ncursesw) -c "$src" -o "$(printf "$out/objs/curses/%02d.o" "$i")"
+		i=$((i + 1))
+	done
+	clang++ -shared %{build_ldflags} -pthread -o "$out/libnative-platform-curses.so" "$out"/objs/curses/*.o $(pkg-config --libs ncursesw)
+	if [ "$with_fe" -eq 1 ]; then
+		mkdir -p "$out/fe-classes" "$out/objs/fe"
+		cat > "$out/gen/net/rubygrapefruit/platform/internal/jni/FileEventsVersion.java" <<END
+package net.rubygrapefruit.platform.internal.jni;
+public interface FileEventsVersion {
+    String VERSION = "$tag";
+}
+END
+		find "$root/file-events/src/main/java" -name '*.java' > "$out/fe.sources"
+		echo "$out/gen/net/rubygrapefruit/platform/internal/jni/FileEventsVersion.java" >> "$out/fe.sources"
+		javac --release 8 -encoding UTF-8 -Xlint:-options \
+			-cp jsr305-stub.jar:"$out/np-classes" -d "$out/fe-classes" -h "$out/headers" @"$out/fe.sources"
+		fe_inc="-I$out/headers -I$jdk_inc -I$jdk_inc/linux -I$root/file-events/src/file-events/headers"
+		i=0
+		for src in "$root"/file-events/src/file-events/cpp/*.cpp; do
+			$cxx $fe_inc -c "$src" -o "$(printf "$out/objs/fe/%02d.o" "$i")"
+			i=$((i + 1))
+		done
+		clang++ -shared %{build_ldflags} -pthread -ldl -o "$out/libnative-platform-file-events.so" "$out"/objs/fe/*.o
+	fi
+	strip --strip-unneeded "$out"/libnative-platform.so "$out"/libnative-platform-curses.so
+	if [ "$with_fe" -eq 1 ]; then
+		strip --strip-unneeded "$out"/libnative-platform-file-events.so
+	fi
+	mkdir -p "$out/np-jar/net/rubygrapefruit/platform/%{np_id}" \
+		"$out/np-jar/net/rubygrapefruit/platform/%{np_id}-ncurses6"
+	cp -a "$out/np-classes/." "$out/np-jar/"
+	rm -rf "$out/np-jar/javax"
+	cp "$out/libnative-platform.so" "$out/np-jar/net/rubygrapefruit/platform/%{np_id}/"
+	cp "$out/libnative-platform-curses.so" "$out/np-jar/net/rubygrapefruit/platform/%{np_id}-ncurses6/"
+	jar cf "$out/native-platform.jar" -C "$out/np-jar" .
+	if [ "$with_fe" -eq 1 ]; then
+		mkdir -p "$out/fe-jar/net/rubygrapefruit/platform/%{np_id}"
+		cp -a "$out/fe-classes/." "$out/fe-jar/"
+		rm -rf "$out/fe-jar/javax"
+		cp "$out/libnative-platform-file-events.so" "$out/fe-jar/net/rubygrapefruit/platform/%{np_id}/"
+		jar cf "$out/file-events.jar" -C "$out/fe-jar" .
+	fi
+	cat > "$out/native-platform.pom" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0">
   <modelVersion>4.0.0</modelVersion>
   <groupId>net.rubygrapefruit</groupId>
   <artifactId>native-platform</artifactId>
-  <version>%{version}</version>
+  <version>$ver</version>
   <name>native-platform</name>
   <description>Java bindings for native operating system APIs.</description>
   <url>https://github.com/gradle/native-platform</url>
@@ -175,14 +188,15 @@ cat > native-platform.pom <<END
     </license>
   </licenses>
 </project>
-END
-cat > file-events.pom <<END
+EOF
+	if [ "$with_fe" -eq 1 ]; then
+		cat > "$out/file-events.pom" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0">
   <modelVersion>4.0.0</modelVersion>
   <groupId>net.rubygrapefruit</groupId>
   <artifactId>file-events</artifactId>
-  <version>%{version}</version>
+  <version>$ver</version>
   <name>file-events</name>
   <description>Native file-system watching for Gradle.</description>
   <url>https://github.com/gradle/native-platform</url>
@@ -196,23 +210,77 @@ cat > file-events.pom <<END
     <dependency>
       <groupId>net.rubygrapefruit</groupId>
       <artifactId>native-platform</artifactId>
-      <version>%{version}</version>
+      <version>$ver</version>
     </dependency>
   </dependencies>
 </project>
-END
+EOF
+	fi
+}
+
+build_one . "%{tag}" "%{version}" out30 0
+build_one "%{name}-%{old_tag}" "%{old_tag}" "%{old_ver}" out26 1
+
+%install
+sysjar install --buildroot %{buildroot} \
+	--artifact out26/native-platform.pom:out26/native-platform.jar \
+	--file-name rubygrapefruit-platform-%{old_ver} \
+	--filelist .mfiles26
+# %{version} owns native-platform.sysjar. %{old_ver} keeps a second index.
+/bin/mv %{buildroot}/usr/share/sysjar/index/net.rubygrapefruit/native-platform.sysjar \
+	%{buildroot}/usr/share/sysjar/index/net.rubygrapefruit/native-platform-%{old_ver}.sysjar
+sed -i 's|/usr/share/sysjar/index/net.rubygrapefruit/native-platform\.sysjar|/usr/share/sysjar/index/net.rubygrapefruit/native-platform-%{old_ver}.sysjar|' .mfiles26
+sysjar install --buildroot %{buildroot} \
+	--artifact out26/file-events.pom:out26/file-events.jar \
+	--file-name rubygrapefruit-fileevents \
+	--filelist .mfiles-fe
+sysjar install --buildroot %{buildroot} \
+	--artifact out30/native-platform.pom:out30/native-platform.jar \
+	--file-name rubygrapefruit-platform \
+	--filelist .mfiles
+while IFS= read -r line; do
+	grep -qxF -- "$line" .mfiles || printf '%s\n' "$line" >> .mfiles
+done < .mfiles26
+grep -v '%dir /usr/share/sysjar/index/net.rubygrapefruit' .mfiles-fe > .mfiles-fe-nodir
+while IFS= read -r line; do
+	grep -qxF -- "$line" .mfiles || printf '%s\n' "$line" >> .mfiles
+done < .mfiles-fe-nodir
 
 %check
 export JAVA_HOME=%{_jvmdir}/java-openjdk
 export PATH=$JAVA_HOME/bin:$PATH
 mkdir -p check
-cat > check/Smoke.java <<'END'
+cat > check/Smoke30.java <<'END'
+import java.io.File;
+import net.rubygrapefruit.platform.Native;
+import net.rubygrapefruit.platform.SystemInfo;
+import net.rubygrapefruit.platform.terminal.Terminals;
+
+public class Smoke30 {
+	public static void main(String[] args) throws Exception {
+		File dir = new File(args[1]);
+		dir.mkdirs();
+		Native n = Native.init(dir);
+		SystemInfo info = n.get(SystemInfo.class);
+		String kernel = info.getKernelName();
+		if (kernel == null || kernel.isEmpty()) {
+			throw new AssertionError("empty kernel");
+		}
+		Terminals terminals = n.get(Terminals.class);
+		if (terminals == null) {
+			throw new AssertionError("no terminals");
+		}
+		System.out.println(args[0] + " " + kernel + " " + info.getArchitecture());
+	}
+}
+END
+cat > check/Smoke26.java <<'END'
 import net.rubygrapefruit.platform.Native;
 import net.rubygrapefruit.platform.SystemInfo;
 import net.rubygrapefruit.platform.terminal.Terminals;
 import net.rubygrapefruit.platform.file.FileEvents;
 
-public class Smoke {
+public class Smoke26 {
 	public static void main(String[] args) {
 		SystemInfo info = Native.get(SystemInfo.class);
 		String kernel = info.getKernelName();
@@ -224,27 +292,22 @@ public class Smoke {
 			throw new AssertionError("no terminals");
 		}
 		FileEvents.init(null);
-		System.out.println(kernel + " " + info.getArchitecture());
+		System.out.println(args[0] + " " + kernel + " " + info.getArchitecture());
 	}
 }
 END
 javac --release 8 -encoding UTF-8 -Xlint:-options \
-	-cp native-platform.jar:file-events.jar -d check check/Smoke.java
-java -cp check:native-platform.jar:file-events.jar Smoke
-
-%install
-# "native" is a Java keyword, so native-platform.jar cannot be an automatic
-# module and jmod.deps would provide jmod(Unable). These file names derive
-# rubygrapefruit.platform and rubygrapefruit.fileevents.
-sysjar install --buildroot %{buildroot} \
-	--artifact native-platform.pom:native-platform.jar \
-	--file-name rubygrapefruit-platform \
-	--filelist .mfiles
-sysjar install --buildroot %{buildroot} \
-	--artifact file-events.pom:file-events.jar \
-	--file-name rubygrapefruit-fileevents \
-	--filelist .mfiles-fe
-grep -v '%dir /usr/share/sysjar/index/net.rubygrapefruit' .mfiles-fe >> .mfiles
+	-cp out30/native-platform.jar -d check check/Smoke30.java
+java --enable-native-access=ALL-UNNAMED \
+	-cp check:out30/native-platform.jar Smoke30 np30_ok check/extract30 > check/np30.log
+cat check/np30.log
+grep -E -q '^np30_ok Linux ' check/np30.log
+javac --release 8 -encoding UTF-8 -Xlint:-options \
+	-cp out26/native-platform.jar:out26/file-events.jar -d check check/Smoke26.java
+java --enable-native-access=ALL-UNNAMED \
+	-cp check:out26/native-platform.jar:out26/file-events.jar Smoke26 np26_ok > check/np26.log
+cat check/np26.log
+grep -E -q '^np26_ok Linux ' check/np26.log
 
 %files -f .mfiles
 %doc LICENSE readme.md
